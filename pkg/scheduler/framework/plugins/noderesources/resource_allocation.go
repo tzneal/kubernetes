@@ -18,7 +18,10 @@ package noderesources
 
 import (
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
+
 	"k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
@@ -108,29 +111,17 @@ func (r *resourceAllocationScorer) calculateResourceAllocatableRequest(nodeInfo 
 
 // calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod
 // the Overhead is added to the result.
-// podResourceRequest = max(sum(podSpec.Containers), podSpec.InitContainers) + overHead
-func (r *resourceAllocationScorer) calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
-	var podRequest int64
-	for i := range pod.Spec.Containers {
-		container := &pod.Spec.Containers[i]
-		value := schedutil.GetRequestForResource(resource, &container.Resources.Requests, !r.useRequested)
-		podRequest += value
-	}
+func (r *resourceAllocationScorer) calculatePodResourceRequest(pod *v1.Pod, resourceName v1.ResourceName) int64 {
+	var quantity resource.Quantity
+	corev1helpers.PodRequests(pod, &corev1helpers.PodResourcesOptions{
+		ContainerFn: func(res v1.ResourceList, containerType corev1helpers.ContainerType) {
+			v := schedutil.GetRequestForResource(resourceName, &res, !r.useRequested)
+			quantity.Add(v)
+		},
+	})
 
-	for i := range pod.Spec.InitContainers {
-		initContainer := &pod.Spec.InitContainers[i]
-		value := schedutil.GetRequestForResource(resource, &initContainer.Resources.Requests, !r.useRequested)
-		if podRequest < value {
-			podRequest = value
-		}
+	if resourceName == v1.ResourceCPU {
+		return quantity.MilliValue()
 	}
-
-	// If Overhead is being utilized, add to the total requests for the pod
-	if pod.Spec.Overhead != nil {
-		if quantity, found := pod.Spec.Overhead[resource]; found {
-			podRequest += quantity.Value()
-		}
-	}
-
-	return podRequest
+	return quantity.Value()
 }

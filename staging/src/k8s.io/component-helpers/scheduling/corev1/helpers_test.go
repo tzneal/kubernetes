@@ -22,6 +22,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -762,4 +763,362 @@ func TestFindMatchingUntoleratedTaint(t *testing.T) {
 			t.Errorf("[%s] expect tolerations %+v tolerate filtered taints %+v in taints %+v", tc.description, tc.tolerations, filteredTaints, tc.taints)
 		}
 	}
+}
+
+func TestPodResourceRequests(t *testing.T) {
+	testCases := []struct {
+		description      string
+		options          *PodResourcesOptions
+		overhead         v1.ResourceList
+		initContainers   []v1.Container
+		containers       []v1.Container
+		expectedRequests v1.ResourceList
+	}{
+		{
+			description: "nil options, larger init container",
+			expectedRequests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("4"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("1"),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "nil options, larger containers",
+			expectedRequests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("3"),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "pod overhead excluded",
+			expectedRequests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5"),
+			},
+			options: &PodResourcesOptions{
+				ExcludeOverhead: true,
+			},
+			overhead: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("1"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("3"),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "pod overhead included",
+			expectedRequests: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("6"),
+				v1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			overhead: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("1"),
+				v1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("3"),
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		p := &v1.Pod{
+			Spec: v1.PodSpec{
+				Containers:     tc.containers,
+				InitContainers: tc.initContainers,
+				Overhead:       tc.overhead,
+			},
+		}
+		request := PodRequests(p, tc.options)
+		if !resourcesEqual(tc.expectedRequests, request) {
+			t.Errorf("[%s] expected requests = %v, got %v", tc.description, tc.expectedRequests, request)
+		}
+	}
+}
+
+func TestPodResourceRequestsReuse(t *testing.T) {
+	expectedRequests := v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("1"),
+	}
+	p := &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: expectedRequests,
+					},
+				},
+			},
+		},
+	}
+
+	opts := &PodResourcesOptions{
+		Reuse: v1.ResourceList{
+			v1.ResourceCPU: resource.MustParse("25"),
+		},
+	}
+	requests := PodRequests(p, opts)
+
+	if !resourcesEqual(expectedRequests, requests) {
+		t.Errorf("expected requests = %v, got %v", expectedRequests, requests)
+	}
+
+	// should re-use the maps we passed in
+	if !resourcesEqual(expectedRequests, opts.Reuse) {
+		t.Errorf("expected to re-use the requests")
+	}
+}
+
+func TestPodResourceLimits(t *testing.T) {
+	testCases := []struct {
+		description    string
+		options        *PodResourcesOptions
+		overhead       v1.ResourceList
+		initContainers []v1.Container
+		containers     []v1.Container
+		expectedLimits v1.ResourceList
+	}{
+		{
+			description: "nil options, larger init container",
+			expectedLimits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("4"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("4"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("1"),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "nil options, larger containers",
+			expectedLimits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("3"),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "pod overhead excluded",
+			expectedLimits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5"),
+			},
+			options: &PodResourcesOptions{
+				ExcludeOverhead: true,
+			},
+			overhead: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("1"),
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("3"),
+						},
+					},
+				},
+			},
+		},
+		{
+			description: "pod overhead included",
+			overhead: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("1"),
+				v1.ResourceMemory: resource.MustParse("1Gi"),
+			},
+			expectedLimits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("6"),
+				// overhead is only added to non-zero limits, so there will be no expected memory limit
+			},
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("2"),
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("3"),
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		p := &v1.Pod{
+			Spec: v1.PodSpec{
+				Containers:     tc.containers,
+				InitContainers: tc.initContainers,
+				Overhead:       tc.overhead,
+			},
+		}
+		limits := PodLimits(p, tc.options)
+		if !resourcesEqual(tc.expectedLimits, limits) {
+			t.Errorf("[%s] expected limits = %v, got %v", tc.description, tc.expectedLimits, limits)
+		}
+	}
+}
+
+func resourcesEqual(lhs, rhs v1.ResourceList) bool {
+	if len(lhs) != len(rhs) {
+		return false
+	}
+	for name, lhsv := range lhs {
+		rhsv, ok := rhs[name]
+		if !ok {
+			return false
+		}
+		if !lhsv.Equal(rhsv) {
+			return false
+		}
+	}
+	return true
 }

@@ -99,3 +99,129 @@ func getFilteredTaints(taints []v1.Taint, inclusionFilter taintsFilterFunc) []v1
 	}
 	return filteredTaints
 }
+
+// ContainerType represents the type of the container
+// A similar type is also defined in k8s.io/kubernetes/pkg/api/pod, but using it would introduce an unwanted
+// dependency
+type ContainerType = byte
+
+const (
+	// ContainerTypeContainers is for normal containers
+	ContainerTypeContainers ContainerType = 1 << iota
+	// ContainerTypeInitContainers is for init containers
+	ContainerTypeInitContainers
+)
+
+// PodResourcesOptions controls the behavior of PodRequests and PodLimits
+type PodResourcesOptions struct {
+	// Reuse, if provided will be reused to accumulate resources and returned by the PodRequests or PodLimits functions.
+	Reuse v1.ResourceList
+	// ExcludeOverhead controls if pod overhead is excluded from the calculation
+	ExcludeOverhead bool
+	// ContainerFn is called with the effective resources required for each container within the pod.
+	ContainerFn func(res v1.ResourceList, containerType ContainerType)
+}
+
+// PodRequests computes the pod requests per the PodResourcesOptions supplied. If PodResourcesOptions is nil, then
+// the requests are returned including pod overhead.
+func PodRequests(pod *v1.Pod, opts *PodResourcesOptions) v1.ResourceList {
+	if opts == nil {
+		// if not set, use the default behavior which also allows us to avoid a bunch of nil checks
+		opts = &PodResourcesOptions{}
+	}
+
+	// attempt to reuse the maps if passed, or allocate otherwise
+	reqs := reuseOrClearResourceList(opts.Reuse)
+
+	for _, container := range pod.Spec.Containers {
+		if opts.ContainerFn != nil {
+			opts.ContainerFn(container.Resources.Requests, ContainerTypeContainers)
+		}
+		addResourceList(reqs, container.Resources.Requests)
+	}
+	// init containers define the minimum of any resource
+	for _, container := range pod.Spec.InitContainers {
+		if opts.ContainerFn != nil {
+			opts.ContainerFn(container.Resources.Requests, ContainerTypeInitContainers)
+		}
+		maxResourceList(reqs, container.Resources.Requests)
+	}
+
+	// Add overhead for running a pod to the sum of requests if requested:
+	if !opts.ExcludeOverhead && pod.Spec.Overhead != nil {
+		addResourceList(reqs, pod.Spec.Overhead)
+	}
+
+	return reqs
+}
+
+// PodLimits computes the pod limits per the PodResourcesOptions supplied. If PodResourcesOptions is nil, then
+// the limits are returned including pod overhead for any non-zero limits.
+func PodLimits(pod *v1.Pod, opts *PodResourcesOptions) v1.ResourceList {
+	if opts == nil {
+		// if not set, use the default behavior which also allows us to avoid a bunch of nil checks
+		opts = &PodResourcesOptions{}
+	}
+
+	// attempt to reuse the maps if passed, or allocate otherwise
+	limits := reuseOrClearResourceList(opts.Reuse)
+
+	for _, container := range pod.Spec.Containers {
+		if opts.ContainerFn != nil {
+			opts.ContainerFn(container.Resources.Limits, ContainerTypeContainers)
+		}
+		addResourceList(limits, container.Resources.Limits)
+	}
+	// init containers define the minimum of any resource
+	for _, container := range pod.Spec.InitContainers {
+		if opts.ContainerFn != nil {
+			opts.ContainerFn(container.Resources.Limits, ContainerTypeInitContainers)
+		}
+		maxResourceList(limits, container.Resources.Limits)
+	}
+
+	// Add overhead to non-zero limits if requested:
+	if !opts.ExcludeOverhead && pod.Spec.Overhead != nil {
+		for name, quantity := range pod.Spec.Overhead {
+			if value, ok := limits[name]; ok && !value.IsZero() {
+				value.Add(quantity)
+				limits[name] = value
+			}
+		}
+	}
+
+	return limits
+}
+
+// addResourceList adds the resources in newList to list.
+func addResourceList(list, newList v1.ResourceList) {
+	for name, quantity := range newList {
+		if value, ok := list[name]; !ok {
+			list[name] = quantity.DeepCopy()
+		} else {
+			value.Add(quantity)
+			list[name] = value
+		}
+	}
+}
+
+// maxResourceList sets list to the greater of list/newList for every resource in newList
+func maxResourceList(list, newList v1.ResourceList) {
+	for name, quantity := range newList {
+		if value, ok := list[name]; !ok || quantity.Cmp(value) > 0 {
+			list[name] = quantity.DeepCopy()
+		}
+	}
+}
+
+// reuseOrClearResourceList is a helper for avoiding excessive allocations of
+// resource lists within the inner loop of resource calculations.
+func reuseOrClearResourceList(reuse v1.ResourceList) v1.ResourceList {
+	if reuse == nil {
+		return make(v1.ResourceList, 4)
+	}
+	for k := range reuse {
+		delete(reuse, k)
+	}
+	return reuse
+}
