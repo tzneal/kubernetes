@@ -14,11 +14,35 @@
 
 package utils
 
-import "os"
+import (
+	"context"
+	"os"
+	"os/exec"
+	"time"
+
+	"k8s.io/klog/v2"
+)
 
 func FileExists(file string) bool {
+	if IsFilesystemHung(path) {
+		return false
+	}
 	if _, err := os.Stat(file); err != nil {
 		return false
 	}
-	return true
+	return true, nil
+}
+func IsFilesystemHung(path string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	stat, err := exec.LookPath("stat")
+	if err != nil {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, stat, path)
+	if err := cmd.Run(); err != nil {
+		klog.Infof("GOT ERR %#v", err)
+		return true
+	}
+	return false
 }
