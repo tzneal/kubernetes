@@ -24,7 +24,7 @@ import (
 )
 
 func FileExists(file string) bool {
-	if IsFilesystemHung(path) {
+	if IsFilesystemHung(file) {
 		return false
 	}
 	if _, err := os.Stat(file); err != nil {
