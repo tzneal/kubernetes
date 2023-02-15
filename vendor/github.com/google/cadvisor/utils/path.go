@@ -19,8 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"time"
-
-	"k8s.io/klog/v2"
+	"log"
 )
 
 func FileExists(file string) bool {
@@ -42,6 +41,7 @@ func IsFilesystemHung(path string) bool {
 	// we don't actually care if the command suceeds or fails, just if it hangs
 	_ = exec.CommandContext(ctx, stat, path).Run()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		log.Printf("Filesystem where %s resides appears hung", path)
 		return true
 	}
 	return false
