@@ -216,7 +216,7 @@ func IsFilesystemHung(path string) bool {
 	cmd := exec.CommandContext(ctx, stat, path)
 	if err := cmd.Run(); err != nil {
 		klog.Infof("GOT ERR %#v for %s", err, path)
-		return true
+		return false
 	}
 	return false
 }
