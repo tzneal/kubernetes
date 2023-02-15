@@ -30,7 +30,7 @@ func FileExists(file string) bool {
 	if _, err := os.Stat(file); err != nil {
 		return false
 	}
-	return true, nil
+	return true
 }
 func IsFilesystemHung(path string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
