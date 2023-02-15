@@ -407,6 +407,9 @@ func (*Mounter) List() ([]MountPoint, error) {
 // will return true. When in fact /tmp/b is a mount point. If this situation
 // is of interest to you, don't use this function...
 func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
+	if IsFilesystemHung(file) {
+		return false, errors.New("filesystem probe failed")
+	}
 	stat, err := os.Stat(file)
 	if err != nil {
 		return true, err

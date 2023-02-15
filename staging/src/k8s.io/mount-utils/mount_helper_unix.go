@@ -20,13 +20,16 @@ limitations under the License.
 package mount
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 	utilio "k8s.io/utils/io"
@@ -180,6 +183,9 @@ func isMountPointMatch(mp MountPoint, dir string) bool {
 // PathExists returns true if the specified path exists.
 // TODO: clean this up to use pkg/util/file/FileExists
 func PathExists(path string) (bool, error) {
+	if IsFilesystemHung(path) {
+		return false, errors.New("filesystem probe failed")
+	}
 	_, err := os.Stat(path)
 	if err == nil {
 		return true, nil
@@ -198,4 +204,19 @@ func PathExists(path string) (bool, error) {
 		return true, err
 	}
 	return false, err
+}
+
+func IsFilesystemHung(path string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	stat, err := exec.LookPath("stat")
+	if err != nil {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, stat, path)
+	if err := cmd.Run(); err != nil {
+		klog.Infof("GOT ERR %#v", err)
+		return true
+	}
+	return false
 }
