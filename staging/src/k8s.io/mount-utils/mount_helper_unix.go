@@ -213,10 +213,10 @@ func IsFilesystemHung(path string) bool {
 	if err != nil {
 		return false
 	}
-	cmd := exec.CommandContext(ctx, stat, path)
-	if err := cmd.Run(); err != nil {
-		klog.Infof("GOT ERR %#v for %s", err, path)
-		return false
+	// we don't actually care if the command suceeds or fails, just if it hangs
+	_ = exec.CommandContext(ctx, stat, path).Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true
 	}
 	return false
 }
