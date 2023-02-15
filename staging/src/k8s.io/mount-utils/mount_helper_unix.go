@@ -216,6 +216,7 @@ func IsFilesystemHung(path string) bool {
 	// we don't actually care if the command suceeds or fails, just if it hangs
 	_ = exec.CommandContext(ctx, stat, path).Run()
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		klog.Warningf("Filesystem where %s resides appears hung", path)
 		return true
 	}
 	return false
