@@ -37,7 +37,9 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
+	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/utils/lru"
 )
 
@@ -382,45 +384,6 @@ func limitRequestRatioConstraint(limitType string, resourceName string, enforced
 	return nil
 }
 
-// sum takes the total of each named resource across all inputs
-// if a key is not in each input, then the output resource list will omit the key
-func sum(inputs []api.ResourceList) api.ResourceList {
-	result := api.ResourceList{}
-	keys := []api.ResourceName{}
-	for i := range inputs {
-		for k := range inputs[i] {
-			keys = append(keys, k)
-		}
-	}
-	for _, key := range keys {
-		total, isSet := int64(0), true
-
-		for i := range inputs {
-			input := inputs[i]
-			v, exists := input[key]
-			if exists {
-				if key == api.ResourceCPU {
-					total = total + v.MilliValue()
-				} else {
-					total = total + v.Value()
-				}
-			} else {
-				isSet = false
-			}
-		}
-
-		if isSet {
-			if key == api.ResourceCPU {
-				result[key] = *(resource.NewMilliQuantity(total, resource.DecimalSI))
-			} else {
-				result[key] = *(resource.NewQuantity(total, resource.DecimalSI))
-			}
-
-		}
-	}
-	return result
-}
-
 // DefaultLimitRangerActions is the default implementation of LimitRangerActions.
 type DefaultLimitRangerActions struct{}
 
@@ -561,48 +524,37 @@ func PodValidateLimitFunc(limitRange *corev1.LimitRange, pod *api.Pod) error {
 
 		// enforce pod limits on init containers
 		if limitType == corev1.LimitTypePod {
-			containerRequests, containerLimits := []api.ResourceList{}, []api.ResourceList{}
-			for j := range pod.Spec.Containers {
-				container := &pod.Spec.Containers[j]
-				containerRequests = append(containerRequests, container.Resources.Requests)
-				containerLimits = append(containerLimits, container.Resources.Limits)
+			v1Pod := &corev1.Pod{}
+			// these conversion functions should never error
+			if err := k8s_api_v1.Convert_core_Pod_To_v1_Pod(pod, v1Pod, nil); err != nil {
+				errs = append(errs, err)
+				return utilerrors.NewAggregate(errs)
 			}
-			podRequests := sum(containerRequests)
-			podLimits := sum(containerLimits)
-			for j := range pod.Spec.InitContainers {
-				container := &pod.Spec.InitContainers[j]
-				// take max(sum_containers, any_init_container)
-				for k, v := range container.Resources.Requests {
-					if v2, ok := podRequests[k]; ok {
-						if v.Cmp(v2) > 0 {
-							podRequests[k] = v
-						}
-					} else {
-						podRequests[k] = v
-					}
-				}
-				for k, v := range container.Resources.Limits {
-					if v2, ok := podLimits[k]; ok {
-						if v.Cmp(v2) > 0 {
-							podLimits[k] = v
-						}
-					} else {
-						podLimits[k] = v
-					}
-				}
+
+			podRequests := corev1helpers.PodRequests(v1Pod, nil)
+			podLimits := corev1helpers.PodLimits(v1Pod, nil)
+			var apiPodRequests, apiPodLimits api.ResourceList
+			if err := k8s_api_v1.Convert_v1_ResourceList_To_core_ResourceList(&podRequests, &apiPodRequests, nil); err != nil {
+				errs = append(errs, err)
+				return utilerrors.NewAggregate(errs)
 			}
+			if err := k8s_api_v1.Convert_v1_ResourceList_To_core_ResourceList(&podLimits, &apiPodLimits, nil); err != nil {
+				errs = append(errs, err)
+				return utilerrors.NewAggregate(errs)
+			}
+
 			for k, v := range limit.Min {
-				if err := minConstraint(string(limitType), string(k), v, podRequests, podLimits); err != nil {
+				if err := minConstraint(string(limitType), string(k), v, apiPodRequests, apiPodLimits); err != nil {
 					errs = append(errs, err)
 				}
 			}
 			for k, v := range limit.Max {
-				if err := maxConstraint(string(limitType), string(k), v, podRequests, podLimits); err != nil {
+				if err := maxConstraint(string(limitType), string(k), v, apiPodRequests, apiPodLimits); err != nil {
 					errs = append(errs, err)
 				}
 			}
 			for k, v := range limit.MaxLimitRequestRatio {
-				if err := limitRequestRatioConstraint(string(limitType), string(k), v, podRequests, podLimits); err != nil {
+				if err := limitRequestRatioConstraint(string(limitType), string(k), v, apiPodRequests, apiPodLimits); err != nil {
 					errs = append(errs, err)
 				}
 			}
