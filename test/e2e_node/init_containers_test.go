@@ -49,6 +49,7 @@ type containerTestConfig struct {
 	Type     containerType
 	ExitCode int
 	Delay    int
+	Restarts int
 }
 
 func (c containerTestConfig) Command() []string {
@@ -59,12 +60,19 @@ func (c containerTestConfig) Command() []string {
 	// The busybox time command doesn't support sub-second display. uptime displays in hundredths of a second, so we
 	// include both and use time since boot for relative ordering
 	timeCmd := "`date +%s` `cat /proc/uptime | awk '{print $1}'`"
-	fmt.Fprintf(&cmd, "echo %s '%s Starting' >> /dev/termination-log; ", timeCmd, c.Name)
-	fmt.Fprintf(&cmd, "echo %s '%s Delaying %d' >> /dev/termination-log; ", timeCmd, c.Name, c.Delay)
+	containerLog := fmt.Sprintf("/persistent/%s.log", c.Name)
+	fmt.Fprintf(&cmd, "echo %s '%s Starting' >> %s; ", timeCmd, c.Name, containerLog)
+	fmt.Fprintf(&cmd, "echo %s '%s Delaying %d' >> %s; ", timeCmd, c.Name, c.Delay, containerLog)
 	if c.Delay != 0 {
 		fmt.Fprintf(&cmd, "sleep %d; ", c.Delay)
 	}
-	fmt.Fprintf(&cmd, "echo %s '%s Exiting' >> /dev/termination-log; ", timeCmd, c.Name)
+	for i := 0; i < c.Restarts; i++ {
+		restartCounter := fmt.Sprintf("/persistent/restart-%s-%d", c.Name, i+1)
+		fmt.Fprintf(&cmd, "if [ ! -f %s ]; then touch %s; echo %s %s Restarting %d >> %s; exit 1; fi; ", restartCounter, restartCounter, timeCmd, c.Name, i+1, containerLog)
+	}
+
+	fmt.Fprintf(&cmd, "echo %s '%s Exiting' >> %s; ", timeCmd, c.Name, containerLog)
+	fmt.Fprintf(&cmd, "cat %s > /dev/termination-log; ", containerLog)
 	fmt.Fprintf(&cmd, "exit %d", c.ExitCode)
 	return []string{"sh", "-c", cmd.String()}
 }
@@ -175,6 +183,78 @@ var _ = SIGDescribe("InitContainers [NodeConformance]", func() {
 		framework.ExpectNoError(results.DoesntStart(regular1))
 	})
 
+	ginkgo.FIt("should restart init containers if requested", func() {
+		init1 := containerTestConfig{
+			Name:     "init-1",
+			Type:     containerTypeInit,
+			Delay:    1,
+			Restarts: 2,
+			ExitCode: 0,
+		}
+		init2 := containerTestConfig{
+			Name:     "init-2",
+			Type:     containerTypeInit,
+			Delay:    1,
+			ExitCode: 0,
+		}
+		regular1 := containerTestConfig{
+			Name:     "regular-1",
+			Type:     containerTypeRegular,
+			Delay:    1,
+			ExitCode: 0,
+		}
+
+		/// generates an out file output like:
+		//
+		// 1678417983 44106.89 init-1 Starting
+		// 1678417983 44106.90 init-1 Delaying 1
+		// 1678417984 44107.90 init-1 Restarting 1
+		// 1678417985 44109.16 init-1 Starting
+		// 1678417985 44109.16 init-1 Delaying 1
+		// 1678417986 44110.16 init-1 Restarting 2
+		// 1678417998 44122.18 init-1 Starting
+		// 1678417998 44122.18 init-1 Delaying 1
+		// 1678417999 44123.18 init-1 Exiting
+		// 1678418000 44124.19 init-2 Starting
+		// 1678418000 44124.19 init-2 Delaying 1
+		// 1678418001 44125.19 init-2 Exiting
+		// 1678418002 44126.21 init-3 Starting
+		// 1678418002 44126.21 init-3 Delaying 1
+		// 1678418003 44127.21 init-3 Exiting
+		// 1678418004 44128.20 regular-1 Starting
+		// 1678418004 44128.20 regular-1 Delaying 1
+		// 1678418005 44129.20 regular-1 Exiting
+
+		podSpec := getContainerOrderingPod("initcontainer-test-pod",
+			init1, init2, regular1)
+
+		client := e2epod.NewPodClient(f)
+
+		podSpec.Spec.RestartPolicy = v1.RestartPolicyOnFailure
+		podSpec = client.Create(context.TODO(), podSpec)
+
+		ginkgo.By("Waiting for the pod to finish")
+		err := e2epod.WaitTimeoutForPodNoLongerRunningInNamespace(context.TODO(), f.ClientSet, podSpec.Name, podSpec.Namespace, 1*time.Minute)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Parsing results")
+		podSpec, err = client.Get(context.Background(), podSpec.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err)
+		results := parseOutput(podSpec)
+
+		// which we then use to make assertions regarding container ordering
+		ginkgo.By("Analyzing results")
+		framework.ExpectNoError(results.StartsBefore(init1, init2))
+		framework.ExpectNoError(results.ExitsBefore(init1, init2))
+
+		framework.ExpectNoError(results.StartsBefore(init2, regular1))
+		framework.ExpectNoError(results.ExitsBefore(init2, regular1))
+
+		// init1 restarts twice, so it should have three starts
+		framework.ExpectNoError(results.StartsNTimes(init1, 3))
+		framework.ExpectNoError(results.StartsNTimes(init2, 1))
+		framework.ExpectNoError(results.StartsNTimes(regular1, 1))
+	})
 })
 
 type containerOutput struct {
@@ -253,6 +333,16 @@ func (o containerOutputList) Exits(c containerTestConfig) error {
 	return nil
 }
 
+func (o containerOutputList) findIndices(name string, command string) []int {
+	var res []int
+	for i, v := range o {
+		if v.containerName == name && v.command == command {
+			res = append(res, i)
+		}
+	}
+	return res
+}
+
 func (o containerOutputList) findIndex(name string, command string) int {
 	for i, v := range o {
 		if v.containerName == name && v.command == command {
@@ -260,6 +350,14 @@ func (o containerOutputList) findIndex(name string, command string) int {
 		}
 	}
 	return -1
+}
+
+func (o containerOutputList) StartsNTimes(lhs containerTestConfig, n int) error {
+	indices := o.findIndices(lhs.Name, "Starting")
+	if len(indices) != n {
+		return fmt.Errorf("couldn't find that container %s started %d times, got %s", lhs.Name, n, o)
+	}
+	return nil
 }
 
 // parseOutput combines the termination log from all of the init and regular containers and parses/sorts the outputs to
@@ -310,6 +408,14 @@ func getContainerOrderingPod(podName string, containerConfigs ...containerTestCo
 		},
 		Spec: v1.PodSpec{
 			RestartPolicy: v1.RestartPolicyNever,
+			Volumes: []v1.Volume{
+				{
+					Name: "persistent",
+					VolumeSource: v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{},
+					},
+				},
+			},
 		},
 	}
 
@@ -327,6 +433,12 @@ func getContainerOrderingPod(podName string, containerConfigs ...containerTestCo
 				},
 				Limits: v1.ResourceList{
 					v1.ResourceMemory: resource.MustParse("15Mi"),
+				},
+			},
+			VolumeMounts: []v1.VolumeMount{
+				{
+					Name:      "persistent",
+					MountPath: "/persistent",
 				},
 			},
 		}
