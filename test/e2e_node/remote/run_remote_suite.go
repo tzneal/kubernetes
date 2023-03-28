@@ -111,8 +111,13 @@ func RunRemoteTestSuite(testSuite TestSuite) {
 	case "gce":
 		runner = NewGCERunner(cfg)
 		sshRunner = NewSSHRunner(cfg)
+	case "aws":
+		runner = NewAWSRunner(cfg)
+		sshRunner = NewSSHRunner(cfg)
 	case "ssh":
 		runner = NewSSHRunner(cfg)
+	default:
+		klog.Fatalf("unsupported runner mode %q", *mode)
 	}
 
 	if err := runner.Validate(); err != nil {
