@@ -30,6 +30,7 @@ import (
 	"time"
 
 	cadvisorapi "github.com/google/cadvisor/lib/model"
+	resourcehelper "k8s.io/component-helpers/resource"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -464,16 +465,17 @@ func (m *ManagerImpl) Allocate(ctx context.Context, pod *v1.Pod, container *v1.C
 	return nil
 }
 
-// UpdatePluginResources updates node resources based on devices already allocated to pods.
+// UpdatePluginResources updates node resources for devices allocated to pods and
+// device plugin resources consumed through pod overhead.
 func (m *ManagerImpl) UpdatePluginResources(node *schedulerframework.NodeInfo, attrs *lifecycle.PodAdmitAttributes) error {
 	pod := attrs.Pod
 
-	// quick return if no pluginResources requested
-	if !m.podDevices.hasPod(string(pod.UID)) {
-		return nil
+	if m.podDevices.hasPod(string(pod.UID)) {
+		m.sanitizeNodeAllocatable(node)
 	}
-
-	m.sanitizeNodeAllocatable(node)
+	if len(pod.Spec.Overhead) > 0 && !m.sourcesReady.AllReady() {
+		m.sanitizeNodeAllocatableForOverhead(node, pod)
+	}
 	return nil
 }
 
@@ -506,7 +508,8 @@ const (
 // Note in the special case after Kubelet restarts, device plugin resource capacities can
 // temporarily drop to zero till corresponding device plugins re-register. This is OK because
 // cm.UpdatePluginResource() run during predicate Admit guarantees we adjust nodeinfo
-// capacity for already allocated pods so that they can continue to run. However, new pods
+// capacity for already allocated pods, and for pods already running that consume the resource
+// through their overhead, so that they can continue to run. However, new pods
 // requiring device plugin resources will not be scheduled till device plugin re-registers.
 func (m *ManagerImpl) GetCapacity(logger klog.Logger) (v1.ResourceList, v1.ResourceList, []string) {
 	var capacity = v1.ResourceList{}
@@ -1211,6 +1214,40 @@ func (m *ManagerImpl) sanitizeNodeAllocatable(node *schedulerframework.NodeInfo)
 			newAllocatableResource = allocatableResource.Clone()
 		}
 		newAllocatableResource.ScalarResources[v1.ResourceName(resource)] = int64(needed)
+	}
+	if newAllocatableResource != nil {
+		node.Allocatable = newAllocatableResource
+	}
+}
+
+// sanitizeNodeAllocatableForOverhead raises nodeInfo allocatable for device
+// plugin resources consumed through pod overhead. Nothing is allocated for
+// overhead, so sanitizeNodeAllocatable does not cover it. It only runs while
+// kubelet is starting: the pods admitted then were bound to the node before the
+// restart, against the capacity kubelet advertised, and their plugins may not
+// have re-registered yet.
+func (m *ManagerImpl) sanitizeNodeAllocatableForOverhead(node *schedulerframework.NodeInfo, pod *v1.Pod) {
+	podRequests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	var newAllocatableResource *schedulerframework.Resource
+	for resourceName := range pod.Spec.Overhead {
+		if _, registered := m.healthyDevices[string(resourceName)]; !registered {
+			continue
+		}
+		podRequest := podRequests[resourceName]
+		needed := node.Requested.ScalarResources[resourceName] + podRequest.Value()
+		if node.Allocatable.ScalarResources[resourceName] >= needed {
+			continue
+		}
+		if newAllocatableResource == nil {
+			newAllocatableResource = node.Allocatable.Clone()
+			if newAllocatableResource.ScalarResources == nil {
+				newAllocatableResource.ScalarResources = make(map[v1.ResourceName]int64)
+			}
+		}
+		newAllocatableResource.ScalarResources[resourceName] = needed
 	}
 	if newAllocatableResource != nil {
 		node.Allocatable = newAllocatableResource

@@ -1930,6 +1930,184 @@ func TestUpdatePluginResources(t *testing.T) {
 	as.Equal(2, int(allocatableScalarResources[v1.ResourceName(resourceName2)]))
 }
 
+type sourcesNotReadyStub struct{}
+
+func (s *sourcesNotReadyStub) AddSource(_ string) {}
+func (s *sourcesNotReadyStub) AllReady() bool     { return false }
+
+const (
+	podOverheadTestResource  = "domain1.com/slot"
+	podOverheadContainerName = "app"
+)
+
+func podOverheadSlots(n int64) v1.ResourceList {
+	return v1.ResourceList{v1.ResourceName(podOverheadTestResource): *resource.NewQuantity(n, resource.DecimalSI)}
+}
+
+func podWithOverhead(uid string, requests, overhead v1.ResourceList) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(uid), Name: uid, Namespace: "default"},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{
+				Name:      podOverheadContainerName,
+				Resources: v1.ResourceRequirements{Requests: requests},
+			}},
+			Overhead: overhead,
+		},
+	}
+}
+
+// TestUpdatePluginResourcesPodOverhead covers device plugin resources that a pod
+// consumes only through its overhead (e.g. set by a RuntimeClass). Kubelet never
+// allocates devices for those, so after a kubelet restart they don't show up in
+// allocatedDevices while the plugin hasn't re-registered yet.
+func TestUpdatePluginResourcesPodOverhead(t *testing.T) {
+	const otherResource = "domain2.com/other"
+
+	testCases := []struct {
+		name                string
+		sourcesReady        bool
+		checkpointResources []string
+		allocatedDeviceIDs  []string
+		allocatable         v1.ResourceList
+		otherPods           []*v1.Pod
+		pod                 *v1.Pod
+		wantAllocatable     int64
+		wantUnchangedFor    v1.ResourceName
+	}{
+		{
+			name:                "pod after kubelet restart",
+			checkpointResources: []string{podOverheadTestResource},
+			allocatable:         podOverheadSlots(0),
+			pod:                 podWithOverhead("pod", nil, podOverheadSlots(1)),
+			wantAllocatable:     1,
+		},
+		{
+			name:                "pod requests resource in container and overhead",
+			checkpointResources: []string{podOverheadTestResource},
+			allocatedDeviceIDs:  []string{"device-1"},
+			allocatable:         podOverheadSlots(0),
+			pod:                 podWithOverhead("pod", podOverheadSlots(1), podOverheadSlots(1)),
+			wantAllocatable:     2,
+		},
+		{
+			name:                "pod counts other pods' overhead",
+			checkpointResources: []string{podOverheadTestResource},
+			allocatable:         podOverheadSlots(0),
+			otherPods:           []*v1.Pod{podWithOverhead("other1", nil, podOverheadSlots(1)), podWithOverhead("other2", nil, podOverheadSlots(1))},
+			pod:                 podWithOverhead("pod", nil, podOverheadSlots(1)),
+			wantAllocatable:     3,
+		},
+		{
+			name:                "allocatable already sufficient",
+			checkpointResources: []string{podOverheadTestResource},
+			allocatable:         podOverheadSlots(4),
+			pod:                 podWithOverhead("pod", nil, podOverheadSlots(1)),
+			wantAllocatable:     4,
+		},
+		{
+			name:                "pod in steady state",
+			sourcesReady:        true,
+			checkpointResources: []string{podOverheadTestResource},
+			allocatable:         podOverheadSlots(0),
+			pod:                 podWithOverhead("pod", nil, podOverheadSlots(1)),
+			wantAllocatable:     0,
+		},
+		{
+			name:                "overhead resource not managed by a device plugin",
+			checkpointResources: []string{otherResource},
+			allocatable:         v1.ResourceList{},
+			pod:                 podWithOverhead("pod", nil, podOverheadSlots(1)),
+			wantUnchangedFor:    podOverheadTestResource,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var sourcesReady config.SourcesReady = &sourcesNotReadyStub{}
+			if tc.sourcesReady {
+				sourcesReady = &sourcesReadyStub{}
+			}
+			m := &ManagerImpl{
+				allocatedDevices: make(map[string]sets.Set[string]),
+				healthyDevices:   make(map[string]sets.Set[string]),
+				podDevices:       newPodDevices(),
+				sourcesReady:     sourcesReady,
+			}
+			for _, resourceName := range tc.checkpointResources {
+				m.healthyDevices[resourceName] = sets.New[string]()
+			}
+			if len(tc.allocatedDeviceIDs) > 0 {
+				m.allocatedDevices[podOverheadTestResource] = sets.New(tc.allocatedDeviceIDs...)
+				m.podDevices.insert(
+					string(tc.pod.UID), podOverheadContainerName, podOverheadTestResource,
+					constructDevices(tc.allocatedDeviceIDs), newContainerAllocateResponse(),
+				)
+			}
+
+			nodeInfo := schedulerframework.NewNodeInfo(tc.otherPods...)
+			nodeInfo.SetNode(&v1.Node{Status: v1.NodeStatus{Allocatable: tc.allocatable}})
+
+			err := m.UpdatePluginResources(nodeInfo, &lifecycle.PodAdmitAttributes{Pod: tc.pod, OtherPods: tc.otherPods})
+			require.NoError(t, err)
+
+			if tc.wantUnchangedFor != "" {
+				_, found := nodeInfo.Allocatable.ScalarResources[tc.wantUnchangedFor]
+				assert.False(t, found, "allocatable for %s must not be added", tc.wantUnchangedFor)
+				return
+			}
+			assert.Equal(t, tc.wantAllocatable, nodeInfo.Allocatable.ScalarResources[v1.ResourceName(podOverheadTestResource)])
+		})
+	}
+}
+
+// TestPredicateAdmitPodOverheadAfterKubeletRestart checks that the kubelet
+// predicate admission handler admits a pod whose overhead requests a device
+// plugin resource while kubelet is starting and the plugin hasn't re-registered
+// yet, and keeps rejecting it once kubelet is running.
+func TestPredicateAdmitPodOverheadAfterKubeletRestart(t *testing.T) {
+	_, tCtx := ktesting.NewTestContext(t)
+
+	node := &v1.Node{
+		Status: v1.NodeStatus{
+			Allocatable: v1.ResourceList{
+				v1.ResourceCPU:    resource.MustParse("4"),
+				v1.ResourceMemory: resource.MustParse("8Gi"),
+				v1.ResourcePods:   resource.MustParse("110"),
+				// The plugin has not re-registered yet.
+				v1.ResourceName(podOverheadTestResource): *resource.NewQuantity(0, resource.DecimalSI),
+			},
+		},
+	}
+	getNode := func(context.Context, bool) (*v1.Node, error) { return node, nil }
+	pod := podWithOverhead("pod", nil, podOverheadSlots(1))
+
+	for _, tc := range []struct {
+		name         string
+		sourcesReady config.SourcesReady
+		wantAdmit    bool
+	}{
+		{name: "kubelet starting", sourcesReady: &sourcesNotReadyStub{}, wantAdmit: true},
+		{name: "kubelet running", sourcesReady: &sourcesReadyStub{}, wantAdmit: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &ManagerImpl{
+				allocatedDevices: make(map[string]sets.Set[string]),
+				healthyDevices:   map[string]sets.Set[string]{podOverheadTestResource: sets.New[string]()},
+				podDevices:       newPodDevices(),
+				sourcesReady:     tc.sourcesReady,
+			}
+			handler := lifecycle.NewPredicateAdmitHandler(getNode, lifecycle.NewAdmissionFailureHandlerStub(), m.UpdatePluginResources)
+
+			result := handler.Admit(tCtx, &lifecycle.PodAdmitAttributes{Pod: pod, Operation: lifecycle.AddOperation})
+			assert.Equal(t, tc.wantAdmit, result.Admit, "got %s: %s", result.Reason, result.Message)
+			if !tc.wantAdmit {
+				assert.Equal(t, lifecycle.InsufficientResourcePrefix+podOverheadTestResource, result.Reason)
+			}
+		})
+	}
+}
+
 func TestDevicePreStartContainer(t *testing.T) {
 	logger, tCtx := ktesting.NewTestContext(t)
 	// Ensures that if device manager is indicated to invoke `PreStartContainer` RPC
